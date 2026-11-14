@@ -1,0 +1,387 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profileExists() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function activeUser() {
+      return profileExists()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isActive == true;
+    }
+
+    function memberMatchesOwnProfile(userId) {
+      let profilePath = /databases/$(database)/documents/users/$(userId);
+      return existsAfter(profilePath)
+        && request.resource.data.uid == userId
+        && request.resource.data.displayName == getAfter(profilePath).data.displayName
+        && request.resource.data.role == getAfter(profilePath).data.role
+        && request.resource.data.dutyCount == getAfter(profilePath).data.dutyCount
+        && request.resource.data.isActive == getAfter(profilePath).data.isActive;
+    }
+
+    function validPreferences(preferences) {
+      return preferences is map
+        && preferences.keys().hasOnly([
+          'language',
+          'theme',
+          'compactSchedule',
+          'inAppNotifications',
+          'browserNotifications',
+          'notifyUrgentAnnouncements',
+          'notifyScheduleChanges',
+          'notifyNewHomework'
+        ])
+        && (!('language' in preferences) || preferences.language in ['ru', 'en', 'kg'])
+        && (!('theme' in preferences) || preferences.theme in ['light', 'dark'])
+        && (!('compactSchedule' in preferences) || preferences.compactSchedule is bool)
+        && (!('inAppNotifications' in preferences) || preferences.inAppNotifications is bool)
+        && (!('browserNotifications' in preferences) || preferences.browserNotifications is bool)
+        && (!('notifyUrgentAnnouncements' in preferences) || preferences.notifyUrgentAnnouncements is bool)
+        && (!('notifyScheduleChanges' in preferences) || preferences.notifyScheduleChanges is bool)
+        && (!('notifyNewHomework' in preferences) || preferences.notifyNewHomework is bool);
+    }
+
+    function validTelegramHandle(handle) {
+      return handle is string
+        && (handle == '' || handle.matches('^[A-Za-z0-9_]{5,32}$'));
+    }
+
+    function validDutyCredit(userId, dutyId, oldCount, newCount) {
+      let rosterPath = /databases/$(database)/documents/duty_roster/$(dutyId);
+      return hasRole('cleaner')
+        && dutyId is string
+        && exists(rosterPath)
+        && existsAfter(rosterPath)
+        && request.auth.uid in get(rosterPath).data.cleanerUids
+        && userId in get(rosterPath).data.cleanerUids
+        && get(rosterPath).data.isCompleted != getAfter(rosterPath).data.isCompleted
+        && (
+          (
+            getAfter(rosterPath).data.isCompleted == true
+            && newCount == oldCount + 1
+          )
+          || (
+            getAfter(rosterPath).data.isCompleted == false
+            && (
+              newCount == oldCount - 1
+              || (oldCount == 0 && newCount == 0)
+            )
+          )
+        );
+    }
+
+    function hasRole(role) {
+      return profileExists()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isActive == true;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function canManageHomework() {
+      return isAdmin() || hasRole('homework_manager');
+    }
+
+    function canPublishAnnouncements() {
+      return isAdmin() || hasRole('teacher');
+    }
+
+    function canUploadMaterials() {
+      return isAdmin() || hasRole('teacher') || hasRole('homework_manager');
+    }
+
+    match /users/{userId} {
+      allow get: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'displayName',
+          'email',
+          'role',
+          'dutyCount',
+          'isActive',
+          'className',
+          'subgroup',
+          'telegramHandle',
+          'status',
+          'preferences',
+          'createdAt'
+        ])
+        && request.resource.data.uid == userId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 80
+        && request.resource.data.role == 'resident'
+        && request.resource.data.dutyCount == 0
+        && request.resource.data.isActive == true
+        && request.resource.data.className == ''
+        && request.resource.data.subgroup == ''
+        && request.resource.data.telegramHandle == ''
+        && request.resource.data.status == ''
+        && validPreferences(request.resource.data.preferences)
+        && request.resource.data.createdAt is timestamp;
+
+      allow update: if isAdmin()
+        || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['displayName', 'updatedAt', 'telegramHandle', 'status', 'preferences'])
+          && (
+            !('displayName' in request.resource.data)
+            || (
+              request.resource.data.displayName is string
+              && request.resource.data.displayName.size() >= 2
+              && request.resource.data.displayName.size() <= 80
+            )
+          )
+          && (
+            !('telegramHandle' in request.resource.data)
+            || validTelegramHandle(request.resource.data.telegramHandle)
+          )
+          && (
+            !('status' in request.resource.data)
+            || request.resource.data.status in ['', 'in_class', 'sick', 'exam_prep']
+          )
+          && (
+            !('preferences' in request.resource.data)
+            || validPreferences(request.resource.data.preferences)
+          )
+        )
+        || (
+          request.resource.data.lastDutyUpdateId is string
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['dutyCount', 'lastDutyUpdateId'])
+          && request.resource.data.dutyCount is int
+          && validDutyCredit(
+            userId,
+            request.resource.data.lastDutyUpdateId,
+            resource.data.dutyCount,
+            request.resource.data.dutyCount
+          )
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    match /members/{userId} {
+      // Public roster contains no email or private account details.
+      allow get, list: if activeUser();
+
+      allow create: if isAdmin()
+        || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly([
+            'id',
+            'uid',
+            'displayName',
+            'role',
+            'dutyCount',
+            'isActive'
+          ])
+          && request.resource.data.id == userId
+          && (
+            memberMatchesOwnProfile(userId)
+            || (
+              request.resource.data.dutyCount is int
+              && getAfter(/databases/$(database)/documents/users/$(userId)).data.lastDutyUpdateId is string
+              && validDutyCredit(
+                userId,
+                getAfter(/databases/$(database)/documents/users/$(userId)).data.lastDutyUpdateId,
+                get(/databases/$(database)/documents/users/$(userId)).data.dutyCount,
+                request.resource.data.dutyCount
+              )
+            )
+          )
+        );
+
+      allow update: if isAdmin()
+        || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['displayName'])
+          && (
+            !('displayName' in request.resource.data)
+            || (
+              request.resource.data.displayName is string
+              && request.resource.data.displayName.size() >= 2
+              && request.resource.data.displayName.size() <= 80
+            )
+          )
+        )
+        || (
+          request.resource.data.dutyCount is int
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['dutyCount'])
+          && request.resource.data.dutyCount
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.dutyCount
+          && validDutyCredit(
+            userId,
+            getAfter(/databases/$(database)/documents/users/$(userId)).data.lastDutyUpdateId,
+            resource.data.dutyCount,
+            request.resource.data.dutyCount
+          )
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    match /class_profiles/{userId} {
+      allow get, list: if activeUser()
+        && (
+          isAdmin()
+          || resource.data.className
+            == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('className', '')
+        );
+
+      allow create: if isAdmin()
+        || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly([
+            'id',
+            'uid',
+            'displayName',
+            'isActive',
+            'className',
+            'subgroup',
+            'telegramHandle',
+            'status'
+          ])
+          && request.resource.data.id == userId
+          && request.resource.data.uid == userId
+          && request.resource.data.displayName
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.displayName
+          && request.resource.data.isActive
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.isActive
+          && request.resource.data.className
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.get('className', '')
+          && request.resource.data.subgroup
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.get('subgroup', '')
+          && request.resource.data.telegramHandle
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.get('telegramHandle', '')
+          && request.resource.data.status
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.get('status', '')
+        );
+
+      allow update: if isAdmin()
+        || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['displayName', 'telegramHandle', 'status'])
+          && request.resource.data.displayName
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.displayName
+          && request.resource.data.isActive == resource.data.isActive
+          && request.resource.data.className == resource.data.className
+          && request.resource.data.subgroup == resource.data.subgroup
+          && request.resource.data.telegramHandle
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.get('telegramHandle', '')
+          && request.resource.data.status
+            == getAfter(/databases/$(database)/documents/users/$(userId)).data.get('status', '')
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    match /homework_progress/{progressId} {
+      allow read: if activeUser() && resource.data.uid == request.auth.uid;
+      allow create: if activeUser()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          'id',
+          'uid',
+          'homeworkId',
+          'completed',
+          'updatedAt'
+        ])
+        && request.resource.data.id == progressId
+        && request.resource.data.homeworkId is string
+        && request.resource.data.completed is bool
+        && request.resource.data.updatedAt is string;
+      allow update: if activeUser()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.homeworkId == resource.data.homeworkId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['completed', 'updatedAt'])
+        && request.resource.data.completed is bool
+        && request.resource.data.updatedAt is string;
+      allow delete: if activeUser() && resource.data.uid == request.auth.uid;
+    }
+
+    match /homework/{recordId} {
+      allow read: if activeUser();
+      allow create, update, delete: if canManageHomework();
+    }
+
+    match /announcements/{recordId} {
+      allow read: if activeUser();
+      allow create, update, delete: if canPublishAnnouncements();
+    }
+
+    match /subjects/{recordId} {
+      allow read: if activeUser();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /schedule/{recordId} {
+      allow read: if activeUser();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /duty_roster/{recordId} {
+      allow read: if activeUser();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (
+          hasRole('cleaner')
+          && resource.data.cleanerUids is list
+          && request.auth.uid in resource.data.cleanerUids
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['isCompleted', 'checkedByUid', 'updatedAt'])
+          && (
+            (
+              request.resource.data.isCompleted == true
+              && request.resource.data.checkedByUid == request.auth.uid
+            )
+            || (
+              request.resource.data.isCompleted == false
+              && request.resource.data.checkedByUid == ''
+            )
+          )
+        );
+    }
+
+    match /materials/{recordId} {
+      allow read: if activeUser();
+      allow create: if canUploadMaterials();
+      allow update, delete: if isAdmin();
+    }
+
+    match /audit_logs/{recordId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // Unknown and currently unused collections stay closed by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
