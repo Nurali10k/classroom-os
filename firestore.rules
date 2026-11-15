@@ -179,7 +179,8 @@ service cloud.firestore {
 
     match /members/{userId} {
       // Public roster contains no email or private account details.
-      allow get, list: if activeUser();
+      allow get: if signedIn() && (request.auth.uid == userId || activeUser());
+      allow list: if activeUser();
 
       allow create: if isAdmin()
         || (
@@ -242,7 +243,20 @@ service cloud.firestore {
     }
 
     match /class_profiles/{userId} {
-      allow get, list: if activeUser()
+      allow get: if signedIn()
+        && (
+          request.auth.uid == userId
+          || (
+            activeUser()
+            && (
+              isAdmin()
+              || resource.data.className
+                == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('className', '')
+            )
+          )
+        );
+
+      allow list: if activeUser()
         && (
           isAdmin()
           || resource.data.className
